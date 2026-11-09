@@ -106,6 +106,8 @@ export async function fixture(timeout = 2000) {
     SAP_PASSWORD: "fixture-password",
     SAP_CLIENT: "100",
     SAP_REQUEST_TIMEOUT_MS: String(timeout),
+    // La fixture esercita anche le scritture (setObjectSource): catalogo completo.
+    SAP_READ_ONLY: "0",
   };
   const runtime = new Runtime(env);
   return {

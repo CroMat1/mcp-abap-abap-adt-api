@@ -8,11 +8,13 @@ import { ResultPages, textResult } from "./lib/results.js";
 import { BoundedHttpClient, requestContext } from "./lib/http.js";
 import { ErrorCode, McpError, safeError } from "./lib/errors.js";
 import { toolSchema } from "./schema.js";
-const mutations = new Set(
-  `login logout dropSession createTransport setTransportsConfig createTransportsConfig transportDelete transportRelease transportSetOwner transportAddUser lock unLock setObjectSource deleteObject activateObjects activateByName createObject runClass createTestInclude setPrettyPrinterSetting gitCreateRepo gitPullRepo gitUnlinkRepo stageRepo pushRepo switchRepoBranch publishServiceBinding unPublishServiceBinding debuggerListen debuggerDeleteListener debuggerSetBreakpoints debuggerDeleteBreakpoints debuggerAttach debuggerSaveSettings debuggerStep debuggerGoToStack debuggerSetVariableValue renameExecute createAtcRun atcRequestExemption atcChangeContact tracesSetParameters tracesCreateConfiguration tracesDeleteConfiguration tracesDelete extractMethodExecute unitTestRun unitTestEvaluation`.split(
-    " ",
-  ),
-);
+import {
+  isMutation,
+  isWriteTool,
+  readOnlyMode,
+  toolAnnotations,
+  toolDescription,
+} from "./toolPolicy.js";
 function argumentSecrets(args: unknown): string[] {
   const found: string[] = [];
   const visit = (value: unknown) => {
@@ -34,7 +36,6 @@ function argumentSecrets(args: unknown): string[] {
   visit(args);
   return found;
 }
-const local = new Set(["healthcheck", "readResultPage", "isProposalMessage"]);
 export class Runtime {
   readonly cache = new SourceCache();
   readonly pages = new ResultPages();
@@ -43,11 +44,14 @@ export class Runtime {
   readonly client?: ADTClient;
   readonly secrets: string[];
   readonly timeoutMs: number;
+  /** SAP_READ_ONLY (attiva per default): le scritture non sono registrate ne' eseguibili. */
+  readonly readOnly: boolean;
   private active?: { abort: AbortController; done: Promise<unknown> };
   private closing = false;
   private recoveryRequired = false;
   constructor(env: NodeJS.ProcessEnv = process.env) {
     this.secrets = [env.SAP_PASSWORD ?? "", env.SAP_BEARER_TOKEN ?? ""];
+    this.readOnly = readOnlyMode(env);
     this.timeoutMs = Number(env.SAP_REQUEST_TIMEOUT_MS ?? 60000);
     if (
       !Number.isInteger(this.timeoutMs) ||
@@ -110,6 +114,12 @@ export class Runtime {
     )
       throw new Error("Duplicate tool name");
   }
+  /** Tool handler pubblicati in tools/list (in sola lettura senza le scritture). */
+  get exposedTools() {
+    return this.readOnly
+      ? this.tools.filter((t) => !isWriteTool(t.definition.name))
+      : this.tools;
+  }
   async invoke(
     name: string,
     args: Record<string, unknown>,
@@ -117,13 +127,21 @@ export class Runtime {
   ) {
     if (this.closing)
       throw new McpError(ErrorCode.InternalError, "Server is closing");
+    // Difesa in profondita': in sola lettura una scrittura non e' in tools/list, ma un
+    // client con un catalogo vecchio potrebbe chiamarla lo stesso.
+    if (this.readOnly && isWriteTool(name))
+      throw new McpError(
+        ErrorCode.MethodNotFound,
+        `Tool '${name}' is a write tool and this server runs in read-only mode (SAP_READ_ONLY)`,
+      );
     if (name === "healthcheck")
       return textResult({
         status: "ready",
         sapConfigured: !!this.client,
         sapConnectionVerified: false,
         sessionRecoveryRequired: this.recoveryRequired,
-        tools: 128,
+        readOnly: this.readOnly,
+        tools: this.exposedTools.length + 2,
       });
     if (name === "readResultPage")
       return textResult(
@@ -166,7 +184,7 @@ export class Runtime {
     if (signal?.aborted) cancel();
     const deadline = performance.now() + this.timeoutMs;
     const timer = setTimeout(cancel, this.timeoutMs);
-    if (mutations.has(name)) {
+    if (isMutation(name)) {
       this.cache.clear();
       this.pages.clear();
     }
@@ -241,14 +259,9 @@ export function createServer(runtime: Runtime) {
     server.registerTool(
       name,
       {
-        description,
+        description: toolDescription(name, description),
         inputSchema: schema,
-        annotations: {
-          readOnlyHint: !mutations.has(name),
-          destructiveHint: mutations.has(name),
-          idempotentHint: !mutations.has(name) && name !== "reentranceTicket",
-          openWorldHint: !local.has(name),
-        },
+        annotations: toolAnnotations(name),
       },
       async (args, ctx) => {
         const controller = new AbortController();
@@ -277,7 +290,7 @@ export function createServer(runtime: Runtime) {
         }
       },
     );
-  for (const t of runtime.tools)
+  for (const t of runtime.exposedTools)
     register(t.definition.name, t.definition.description, t.validation.schema);
   register(
     "healthcheck",

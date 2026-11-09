@@ -19,6 +19,9 @@ export async function verify(
     const env = Object.fromEntries(
       Object.entries(process.env).filter(([key]) => !key.startsWith("SAP_")),
     );
+    // Il flusso verificato comprende una scrittura (setObjectSource): catalogo completo.
+    // La sola lettura (default) e' coperta da test/readOnly.test.ts.
+    env.SAP_READ_ONLY = "0";
     if (f)
       Object.assign(env, {
         SAP_URL: f.url,

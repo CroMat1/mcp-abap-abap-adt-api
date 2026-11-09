@@ -30,6 +30,38 @@ Environment comes from the MCP client. Dotenv loads only when `SAP_ENV_FILE` exp
 
 An authorized broker's static `SAP_BEARER_TOKEN` can replace the password. Rotate it by restarting the process; this does not implement XSUAA grants or prove tenant acceptance. No password-grant flow is introduced.
 
+## Modalità sola lettura
+
+Questo fork punta all'ABAP del BW/4HANA di **produzione**, quindi il server parte in sola lettura
+salvo indicazione contraria.
+
+| `SAP_READ_ONLY` | effetto |
+|---|---|
+| non impostata, vuota, `1` o qualunque altro valore | **sola lettura**: 83 tool su 128 |
+| `0` oppure `false` (senza distinzione di maiuscole) | catalogo completo: 128 tool |
+
+In sola lettura i 45 tool di scrittura **non vengono registrati** in `tools/list` e `Runtime.invoke` li
+rifiuta comunque, prima di qualunque richiesta a SAP, se un client con un catalogo vecchio li chiama.
+Sono scritture: trasporti (`createTransport`, `transport*` che modificano, `setTransportsConfig`,
+`createTransportsConfig`), `lock`/`unLock`, `setObjectSource`, `createObject`, `createTestInclude`,
+`deleteObject`, `activateObjects`/`activateByName`, `runClass`, `unitTestRun`/`unitTestEvaluation`,
+abapGit (`gitCreateRepo`, `gitPullRepo`, `gitUnlinkRepo`, `stageRepo`, `pushRepo`, `switchRepoBranch`),
+service binding (publish/unpublish), debugger che agisce sulla sessione, refactoring `*Execute`,
+ATC (`createAtcRun`, `atcRequestExemption`, `atcChangeContact`), trace che scrivono o cancellano,
+`setPrettyPrinterSetting`.
+
+Restano esposti `login`, `logout` e `dropSession` (toccano solo la sessione e servono per il recupero
+dopo un timeout) e `healthcheck`, che riporta `readOnly` e il numero di tool esposti.
+`runQuery` e `tableContents` restano, ma la descrizione inizia con "ATTENZIONE: legge dati di
+produzione".
+
+La classificazione sta in un solo punto, `src/toolPolicy.ts` (`WRITE_TOOLS`, `DESTRUCTIVE_TOOLS`,
+`SESSION_TOOLS`, `DATA_READ_TOOLS`), che alimenta anche le annotazioni MCP standard `readOnlyHint`,
+`destructiveHint`, `idempotentHint` e `openWorldHint`. L'elenco dei tool esposti in sola lettura è in
+[`tools-readonly.txt`](tools-readonly.txt); `test/readOnly.test.ts` confronta il catalogo con quel file,
+quindi un tool nuovo non classificato fa fallire i test invece di comparire in silenzio in sola lettura.
+`npm run verify:stdio` gira con `SAP_READ_ONLY=0` perché il flusso verificato comprende una scrittura.
+
 ## Session and limits
 
 Only one operation runs at a time; overlaps receive a busy error. Debugger listeners also occupy this session until completed or cancelled. `SAP_REQUEST_TIMEOUT_MS` defaults to60000 and accepts100..120000, including login and every underlying HTTP request. Cancellation closes real sockets. The client does not follow redirects, inherit environment proxies, retry mutations or automatically reauthenticate a stateful call. An interrupted write may already have changed SAP: inspect writes and locks, then explicitly `login`, `dropSession` or `logout` to recover. Shutdown attempts a bounded logout; unreachable SAP can retain state until its own expiry.
