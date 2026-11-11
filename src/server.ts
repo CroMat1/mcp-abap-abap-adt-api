@@ -1,6 +1,6 @@
 import { CompatibleAdtClient } from "./lib/adt-client.js";
 import { McpServer } from "@modelcontextprotocol/server";
-import { ADTClient, session_types } from "abap-adt-api";
+import { ADTClient, isLoginError, session_types } from "abap-adt-api";
 import { z } from "zod";
 import { createHandlers } from "./handlers/registry.js";
 import { SourceCache } from "./lib/sourceCache.js";
@@ -9,6 +9,9 @@ import { BoundedHttpClient, requestContext } from "./lib/http.js";
 import { ErrorCode, McpError, safeError } from "./lib/errors.js";
 import { toolSchema } from "./schema.js";
 import {
+  LOCAL_TOOLS,
+  SESSION_TOOLS,
+  autoReloginMode,
   isMutation,
   isWriteTool,
   readOnlyMode,
@@ -36,6 +39,26 @@ function argumentSecrets(args: unknown): string[] {
   visit(args);
   return found;
 }
+/** Sessione SAP scaduta o CSRF non piu' valido: AdtCsrfException oppure HTTP 401. */
+export function isSessionExpired(error: unknown): boolean {
+  try {
+    return !!error && typeof error === "object" && isLoginError(error as any);
+  } catch {
+    return false;
+  }
+}
+/** Evento sintetico su stderr (stdout e' il canale MCP). Mai credenziali: solo nome del tool ed esito. */
+export type SessionEvent = {
+  event: "sap_session_relogin";
+  tool: string;
+  outcome: "retry_ok" | "relogin_failed" | "retry_failed";
+};
+const stderrSessionLog = (e: SessionEvent) => {
+  process.stderr.write(
+    JSON.stringify({ level: "warn", service: "mcp-abap-abap-adt-api", ...e }) +
+      "\n",
+  );
+};
 export class Runtime {
   readonly cache = new SourceCache();
   readonly pages = new ResultPages();
@@ -46,12 +69,18 @@ export class Runtime {
   readonly timeoutMs: number;
   /** SAP_READ_ONLY (attiva per default): le scritture non sono registrate ne' eseguibili. */
   readonly readOnly: boolean;
+  /** SAP_AUTO_RELOGIN (attiva per default, ha effetto solo in sola lettura): vedi invoke. */
+  readonly autoRelogin: boolean;
+  /** Destinazione degli eventi di sessione; sostituibile nei test. */
+  sessionLog: (e: SessionEvent) => void = stderrSessionLog;
+  private reloginPromise?: Promise<void>;
   private active?: { abort: AbortController; done: Promise<unknown> };
   private closing = false;
   private recoveryRequired = false;
   constructor(env: NodeJS.ProcessEnv = process.env) {
     this.secrets = [env.SAP_PASSWORD ?? "", env.SAP_BEARER_TOKEN ?? ""];
     this.readOnly = readOnlyMode(env);
+    this.autoRelogin = this.readOnly && autoReloginMode(env);
     this.timeoutMs = Number(env.SAP_REQUEST_TIMEOUT_MS ?? 60000);
     if (
       !Number.isInteger(this.timeoutMs) ||
@@ -120,6 +149,39 @@ export class Runtime {
       ? this.tools.filter((t) => !isWriteTool(t.definition.name))
       : this.tools;
   }
+  /**
+   * Rifa' il login con le credenziali gia' configurate. Una sola promessa condivisa: chi
+   * arriva mentre un login e' in corso attende quello, non ne apre un secondo.
+   * Va chiamata dentro un requestContext (BoundedHttpClient rifiuta richieste orfane).
+   */
+  relogin(): Promise<void> {
+    const client = this.client;
+    if (!client)
+      return Promise.reject(
+        new McpError(ErrorCode.InternalError, "SAP is not configured"),
+      );
+    if (!this.reloginPromise)
+      this.reloginPromise = (async () => {
+        try {
+          client.stateful = session_types.stateful;
+          await client.login();
+        } finally {
+          this.reloginPromise = undefined;
+        }
+      })();
+    return this.reloginPromise;
+  }
+  /** Auto-relogin ammesso solo in sola lettura, per un tool che legge e parla con SAP. */
+  private canRelogin(name: string): boolean {
+    return (
+      this.autoRelogin &&
+      this.readOnly &&
+      !!this.client &&
+      !isWriteTool(name) &&
+      !SESSION_TOOLS.has(name) &&
+      !LOCAL_TOOLS.has(name)
+    );
+  }
   async invoke(
     name: string,
     args: Record<string, unknown>,
@@ -141,6 +203,7 @@ export class Runtime {
         sapConnectionVerified: false,
         sessionRecoveryRequired: this.recoveryRequired,
         readOnly: this.readOnly,
+        autoRelogin: this.autoRelogin,
         tools: this.exposedTools.length + 2,
       });
     if (name === "readResultPage")
@@ -192,7 +255,46 @@ export class Runtime {
       this.client.stateful = session_types.stateful;
     const done = requestContext.run({ signal: abort.signal }, async () => {
       abort.signal.throwIfAborted();
-      const result = await entry.handler.handle(name, prepared);
+      let result;
+      try {
+        result = await entry.handler.handle(name, prepared);
+      } catch (error) {
+        // Sola lettura: sessione o CSRF scaduti (inattivita', o dropSession chiamato da un
+        // altro agente sullo stesso processo) non richiedono di ispezionare scritture o lock,
+        // che qui non esistono. Un login e UN solo nuovo tentativo; altrimenti l'errore originale.
+        if (
+          abort.signal.aborted ||
+          !this.canRelogin(name) ||
+          !isSessionExpired(error)
+        )
+          throw error;
+        try {
+          await this.relogin();
+        } catch {
+          this.sessionLog({
+            event: "sap_session_relogin",
+            tool: name,
+            outcome: "relogin_failed",
+          });
+          throw error;
+        }
+        abort.signal.throwIfAborted();
+        try {
+          result = await entry.handler.handle(name, prepared);
+        } catch {
+          this.sessionLog({
+            event: "sap_session_relogin",
+            tool: name,
+            outcome: "retry_failed",
+          });
+          throw error;
+        }
+        this.sessionLog({
+          event: "sap_session_relogin",
+          tool: name,
+          outcome: "retry_ok",
+        });
+      }
       if (performance.now() > deadline) abort.abort();
       abort.signal.throwIfAborted();
       if (["login", "logout", "dropSession"].includes(name))

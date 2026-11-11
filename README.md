@@ -62,9 +62,36 @@ La classificazione sta in un solo punto, `src/toolPolicy.ts` (`WRITE_TOOLS`, `DE
 quindi un tool nuovo non classificato fa fallire i test invece di comparire in silenzio in sola lettura.
 `npm run verify:stdio` gira con `SAP_READ_ONLY=0` perché il flusso verificato comprende una scrittura.
 
+### Auto-relogin in sola lettura (`SAP_AUTO_RELOGIN`)
+
+La sessione ADT è *stateful* (serve ai lock delle scritture), e in quella modalità `abap-adt-api` non
+rifà il login da solo: dopo qualche minuto di inattività, o dopo un `dropSession` chiamato da un altro
+agente sullo stesso processo (la GET stateless chiude il contesto condiviso), ogni chiamata rispondeva
+`SAP session or CSRF token expired; inspect locks/writes and explicitly login again` e chiedeva un
+`login` esplicito. La cautela «inspect locks/writes» vale per le scritture, che in sola lettura non esistono.
+
+| `SAP_AUTO_RELOGIN` | effetto |
+|---|---|
+| non impostata, vuota, `1` o altro | **attivo**, ma solo se `SAP_READ_ONLY` è attivo |
+| `0` oppure `false` | spento: serve il `login` esplicito come prima |
+
+Quando è attivo e un tool di lettura (non `login`/`logout`/`dropSession`, non locale) fallisce per
+sessione o CSRF scaduti (`AdtCsrfException` o HTTP 401), il server rifà il login con le credenziali già
+configurate e ripete la richiesta **una sola volta**, dentro lo stesso timeout. Se il login o il
+secondo tentativo falliscono restituisce l'errore originale. Login concorrenti condividono una sola
+promessa. Su stderr esce un evento JSON sintetico, senza credenziali:
+`{"level":"warn","service":"mcp-abap-abap-adt-api","event":"sap_session_relogin","tool":"getObjectSource","outcome":"retry_ok"}`
+(`outcome`: `retry_ok`, `relogin_failed`, `retry_failed`). Con `SAP_READ_ONLY=0` il comportamento
+non cambia: nessun relogin automatico. `healthcheck` riporta `autoRelogin`.
+
+**Keepalive: non implementato, per scelta.** L'auto-relogin costa un login solo quando la sessione
+scade davvero; un keepalive periodico terrebbe invece aperto un contesto utente stateful sul sistema
+di produzione anche quando nessuno lavora, dovrebbe convivere con il blocco «una richiesta alla
+volta» del server, e non coprirebbe comunque il caso `dropSession`.
+
 ## Session and limits
 
-Only one operation runs at a time; overlaps receive a busy error. Debugger listeners also occupy this session until completed or cancelled. `SAP_REQUEST_TIMEOUT_MS` defaults to60000 and accepts100..120000, including login and every underlying HTTP request. Cancellation closes real sockets. The client does not follow redirects, inherit environment proxies, retry mutations or automatically reauthenticate a stateful call. An interrupted write may already have changed SAP: inspect writes and locks, then explicitly `login`, `dropSession` or `logout` to recover. Shutdown attempts a bounded logout; unreachable SAP can retain state until its own expiry.
+Only one operation runs at a time; overlaps receive a busy error. Debugger listeners also occupy this session until completed or cancelled. `SAP_REQUEST_TIMEOUT_MS` defaults to60000 and accepts100..120000, including login and every underlying HTTP request. Cancellation closes real sockets. The client does not follow redirects, inherit environment proxies, retry mutations or automatically reauthenticate a stateful call, except a read in read-only mode (see `SAP_AUTO_RELOGIN`). An interrupted write may already have changed SAP: inspect writes and locks, then explicitly `login`, `dropSession` or `logout` to recover. Shutdown attempts a bounded logout; unreachable SAP can retain state until its own expiry.
 
 HTTP stays on the configured origin under `/sap/`, with 2MiB requests,4MiB responses and verified TLS. XML entity declarations are rejected. Input JSON is bounded by bytes, nesting, arrays and field contracts. This is a trusted operator tool, not an OS sandbox or multi-user service. Git tools can ask SAP to contact a remote Git service with supplied credentials; those operations depend on SAP and remote permissions.
 

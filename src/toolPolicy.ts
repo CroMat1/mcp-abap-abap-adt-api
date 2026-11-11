@@ -131,6 +131,15 @@ export function readOnlyMode(env: NodeJS.ProcessEnv = process.env): boolean {
   return !(v === "0" || v === "false");
 }
 
+/**
+ * SAP_AUTO_RELOGIN: attivo per default, ma conta solo in sola lettura (SAP_READ_ONLY).
+ * Lo spegne solo "0" o "false". Fuori dalla sola lettura il server non rifa' mai il login da solo.
+ */
+export function autoReloginMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env.SAP_AUTO_RELOGIN ?? "").trim().toLowerCase();
+  return !(v === "0" || v === "false");
+}
+
 export function toolAnnotations(name: string) {
   const write = isWriteTool(name);
   return {
