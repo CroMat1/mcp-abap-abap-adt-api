@@ -9,8 +9,12 @@ import { BoundedHttpClient, requestContext } from "./lib/http.js";
 import { ErrorCode, McpError, safeError } from "./lib/errors.js";
 import { toolSchema } from "./schema.js";
 import {
+  FREE_URL_ARGS,
   LOCAL_TOOLS,
+  PATH_ID_ARGS,
   READ_ONLY_URL_ARGS,
+  argStrings,
+  readOnlyQueryAllowed,
   SESSION_TOOLS,
   autoReloginMode,
   isMutation,
@@ -231,6 +235,20 @@ export class Runtime {
       throw new McpError(
         ErrorCode.InvalidParams,
         `${urlRule.arg} must be an ADT source URL (.../source/main or /sap/bc/adt/oo/classes/<class>/includes/<include>) in read-only mode (SAP_READ_ONLY)`,
+      );
+    // N-ABAP-1: sugli URL liberi niente parametri sap-* (mandante, lingua, utente) ne' ~* (ITS).
+    const freeArg = this.readOnly ? FREE_URL_ARGS[name] : undefined;
+    if (freeArg && !argStrings(prepared[freeArg]).every(readOnlyQueryAllowed))
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `${freeArg} must not carry sap-* or ~* query parameters in read-only mode (SAP_READ_ONLY)`,
+      );
+    // N-ABAP-1: id messi nel percorso senza codifica; un solo segmento, sempre.
+    const idRule = PATH_ID_ARGS[name];
+    if (idRule && !idRule.allowed(String(prepared[idRule.arg] ?? "")))
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `${idRule.arg} must be a single path segment (no '/', '..', '?', even encoded)`,
       );
     if (signal?.aborted)
       throw new McpError(

@@ -5,11 +5,18 @@ import type { HttpClient } from "abap-adt-api";
 import { McpError, ErrorCode } from "./errors.js";
 export const requestContext = new AsyncLocalStorage<{ signal: AbortSignal }>();
 
+/** Caratteri ammessi in un segmento di percorso, dopo la decodifica e prima delle minuscole: solo
+ *  ASCII. Bastano per i nomi ABAP (anche `=` dei class pool, `$` dei pacchetti locali, `/` dei
+ *  namespace, che diventa un separatore) e per gli id di ADT (`bti1033_acd_00,AT000000.DAT`).
+ *  Restano fuori, fra gli altri: lettere non ASCII (`ſ`, `ı`, fullwidth, segno Kelvin), spazio,
+ *  `;` (parametri di segmento), parentesi (URL mangling `(bD1lbg==)`), `?`, `#`, `%`, `\`. */
+const SEGMENT_CHARS = /^[A-Za-z0-9_$~=.!*+,:@-]+$/;
+
 /**
  * Percorso SAP come lo vedrebbe ICF nel caso peggiore: decodificato fino a stabilita', in
- * minuscolo (i nodi ICF non distinguono le maiuscole), senza parametri di segmento (`;...`) e
- * senza slash doppi. Restituisce null se la forma e' ambigua: decodifica non valida o ancora
- * instabile dopo 5 passi, caratteri di controllo, backslash, segmenti `.` o `..`.
+ * minuscolo (i nodi ICF non distinguono le maiuscole) e senza slash doppi. Restituisce null se la
+ * forma e' ambigua: decodifica non valida o ancora instabile dopo 5 passi, un segmento con
+ * caratteri fuori da SEGMENT_CHARS (N-ABAP-1), un segmento `.` o `..`, o che finisce con `.`.
  */
 export function normalizedSapPath(pathname: string): string | null {
   let decoded = pathname;
@@ -24,15 +31,20 @@ export function normalizedSapPath(pathname: string): string | null {
     if (i >= 4) return null;
     decoded = next;
   }
-  if (/[\x00-\x1f\x7f\\]/.test(decoded)) return null;
-  const segments = decoded
-    .toLowerCase()
-    .split("/")
-    .map((s) => s.split(";")[0])
-    .filter((s) => s !== "");
-  if (segments.some((s) => s === "." || s === "..")) return null;
-  return "/" + segments.join("/");
+  const segments = decoded.split("/").filter((s) => s !== "");
+  if (segments.some((s) => !SEGMENT_CHARS.test(s) || s.endsWith("."))) return null;
+  return "/" + segments.join("/").toLowerCase();
 }
+
+/**
+ * N-ABAP-1: in sola lettura si esce da /sap/bc/adt/ solo per i percorsi che la libreria usa da se'.
+ * Login, CSRF, keepalive e dropSession usano /sap/bc/adt/compatibility/graph (AdtHTTP.js:77, :121,
+ * :146) e la discovery sta sotto /sap/bc/adt/: l'unica eccezione e' il logout.
+ *  - /sap/public/bc/icf/logoff: AdtHTTP.js:135 (logout), percorso esatto.
+ * Tutto il resto di /sap/ (WebGUI, WebRFC, OData, echo, BSP...) viene rifiutato prima della rete.
+ */
+export const READ_ONLY_ROOT = "/sap/bc/adt/";
+export const READ_ONLY_EXTRA_PATHS: readonly string[] = ["/sap/public/bc/icf/logoff"];
 
 /**
  * Percorsi vietati in sola lettura anche in GET (giro 2, check-fx-abap.md). Si confrontano sul
@@ -43,10 +55,12 @@ export function normalizedSapPath(pathname: string): string | null {
  */
 export const READ_ONLY_BLOCKED_PATHS: readonly string[] = ["/sap/bc/adt/security"];
 
-/** Vero se in sola lettura il percorso va rifiutato: forma ambigua o sotto un percorso vietato. */
+/** Vero se in sola lettura il percorso va rifiutato: forma ambigua, fuori da /sap/bc/adt/ (salvo
+ *  READ_ONLY_EXTRA_PATHS) o sotto un percorso vietato. */
 export function readOnlyPathBlocked(pathname: string): boolean {
   const n = normalizedSapPath(pathname);
   if (n === null) return true;
+  if (!n.startsWith(READ_ONLY_ROOT) && !READ_ONLY_EXTRA_PATHS.includes(n)) return true;
   return READ_ONLY_BLOCKED_PATHS.some((p) => n === p || n.startsWith(p + "/"));
 }
 
@@ -175,7 +189,7 @@ export class BoundedHttpClient implements HttpClient {
     if (this.readOnly && readOnlyPathBlocked(url.pathname))
       throw new McpError(
         ErrorCode.InvalidParams,
-        `SAP ${method} rejected: read-only mode (SAP_READ_ONLY) blocks this path (sensitive or ambiguous)`,
+        `SAP ${method} rejected: read-only mode (SAP_READ_ONLY) admits only /sap/bc/adt/ paths (plus the library logoff); this path is outside, sensitive or ambiguous`,
       );
     if (this.readOnly && !readOnlyRequestAllowed(method, url))
       throw new McpError(

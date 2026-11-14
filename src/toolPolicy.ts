@@ -261,8 +261,9 @@ export function isReadOnlyAllowed(name: string): boolean {
  *    tabelle e strutture (le forme dell'esempio in sph-bw-inventario/SKILL.md);
  *  - /sap/bc/adt/oo/classes/<classe>/includes/<include>: gli include di classe di classIncludes. */
 const SOURCE_URL_SHAPES = [
-  /^\/sap\/bc\/adt\/(?:[a-z0-9_%$~-]+\/)+source\/main$/,
-  /^\/sap\/bc\/adt\/oo\/classes\/[a-z0-9_%$~-]+\/includes\/[a-z]+$/,
+  // `=` per gli include dei class pool (ZCL_X=====CP), N-ABAP-1.
+  /^\/sap\/bc\/adt\/(?:[a-z0-9_%$~=-]+\/)+source\/main$/,
+  /^\/sap\/bc\/adt\/oo\/classes\/[a-z0-9_%$~=-]+\/includes\/[a-z]+$/,
 ];
 
 /**
@@ -293,6 +294,85 @@ export function readOnlySourceUrlAllowed(raw: string): boolean {
 /** Argomenti URL vincolati in sola lettura: tool -> argomento e controllo. */
 export const READ_ONLY_URL_ARGS: Record<string, { arg: string; allowed: (raw: string) => boolean }> = {
   getObjectSource: { arg: "objectSourceUrl", allowed: readOnlySourceUrlAllowed },
+};
+
+/**
+ * N-ABAP-1, punto 3: tool di lettura che passano un URL scelto da chi chiama come percorso della
+ * richiesta (riga di node_modules/abap-adt-api/build accanto). Per bindingDetails l'URL sta nei
+ * link dell'oggetto `binding`, quindi si controllano tutte le sue stringhe.
+ */
+export const FREE_URL_ARGS: Record<string, string> = {
+  getObjectSource: "objectSourceUrl", // api/objectcontents.js:13
+  objectStructure: "objectUrl", // src/lib/adt-client.ts:27
+  classIncludes: "clas", // via objectStructure
+  classComponents: "url", // api/syntax.js:248
+  mainPrograms: "includeUrl", // api/activate.js:84
+  revisions: "objectUrl", // api/revisions.js:36
+  getTransportConfiguration: "url", // api/transports.js:298
+  bindingDetails: "binding", // api/tablecontents.js:67 e :186
+};
+
+/** Falso se l'URL porta nella query un parametro che cambia mandante, lingua, utente o sessione
+ *  (`sap-client`, `sap-language`, `sap-user`, ... cioe' ogni `sap-*`, maiuscole comprese) o un
+ *  parametro ITS `~*` (`~transaction`). La libreria li usa per conto suo solo al login
+ *  (`sap-client`/`sap-language`, AdtHTTP.js:115-118), che non passa da qui. */
+export function readOnlyQueryAllowed(raw: string): boolean {
+  const q = raw.indexOf("?");
+  if (q < 0) return true;
+  const params = new URLSearchParams(raw.slice(q + 1).split("#")[0]);
+  for (const key of params.keys()) {
+    const k = key.trim().toLowerCase();
+    if (k.startsWith("sap-") || k.startsWith("~")) return false;
+  }
+  return true;
+}
+
+/** Tutte le stringhe di un argomento (anche annidate), per bindingDetails. */
+export function argStrings(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (value && typeof value === "object") return Object.values(value).flatMap(argStrings);
+  return [];
+}
+
+const TRACE_PREFIX = "/sap/bc/adt/runtime/traces/abaptraces/";
+function safeDecode(s: string): string | null {
+  let d = s;
+  for (let i = 0; i < 5; i++) {
+    let n: string;
+    try {
+      n = decodeURIComponent(d);
+    } catch {
+      return null;
+    }
+    if (n === d) return d;
+    d = n;
+  }
+  return null;
+}
+
+/** Id di una trace ABAP: un solo segmento (es. `bti1033_acd_00%2cAT000000.DAT`), oppure l'URL completo
+ *  che restituisce tracesList (`/sap/bc/adt/runtime/traces/abaptraces/<id>`). La libreria lo
+ *  concatena senza codificarlo (api/traces.js:23-25): niente `/`, `..`, `?`, nemmeno codificati. */
+export function traceIdAllowed(raw: string): boolean {
+  const seg = raw.startsWith(TRACE_PREFIX) ? raw.slice(TRACE_PREFIX.length) : raw;
+  if (!/^[A-Za-z0-9_.,%-]{1,255}$/.test(seg)) return false;
+  const d = safeDecode(seg);
+  return d !== null && /^[A-Za-z0-9_.,-]+$/.test(d) && d !== "." && d !== ".." && !d.endsWith(".");
+}
+
+/** Id di un run ATC (worklistId restituito da SAP): un solo segmento alfanumerico. La libreria lo
+ *  concatena senza codificarlo (api/atc.js:243). */
+export function atcRunIdAllowed(raw: string): boolean {
+  return /^[A-Za-z0-9_-]{1,128}$/.test(raw);
+}
+
+/** N-ABAP-1, punto 4: id che la libreria mette nel percorso senza codificarli. Valgono sempre,
+ *  non solo in sola lettura: risalire con `../` non e' mai un uso legittimo. */
+export const PATH_ID_ARGS: Record<string, { arg: string; allowed: (raw: string) => boolean }> = {
+  tracesHitList: { arg: "id", allowed: traceIdAllowed },
+  tracesDbAccess: { arg: "id", allowed: traceIdAllowed },
+  tracesStatements: { arg: "id", allowed: traceIdAllowed },
+  atcWorklists: { arg: "runResultId", allowed: atcRunIdAllowed },
 };
 
 /**

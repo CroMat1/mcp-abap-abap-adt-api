@@ -150,6 +150,7 @@ test("getObjectSource in sola lettura: solo URL con la forma dei sorgenti ADT", 
     "/sap/bc/adt/ddic/ddl/sources/zcds/source/main",
     "/sap/bc/adt/ddic/tables/ztab/source/main",
     "/sap/bc/adt/oo/classes/zcl_x/source/main?version=active",
+    "/sap/bc/adt/programs/includes/zcl_x=====cp/source/main",
   ])
     assert.equal(readOnlySourceUrlAllowed(ok), true, ok);
   for (const bad of [

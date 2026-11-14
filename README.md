@@ -57,10 +57,14 @@ Seconda difesa, indipendente dall'elenco dei tool: in sola lettura `BoundedHttpC
 (`src/lib/http.ts`) rifiuta, prima della rete, ogni metodo diverso da GET, salvo le POST di
 `READ_ONLY_POSTS`. È un elenco chiuso di percorsi esatti, ciascuno con le sole chiavi di query che
 la libreria invia (e il valore obbligato quando distingue la voce), e con la riga di `abap-adt-api`
-che lo usa. In sola lettura il client rifiuta anche le GET sotto `/sap/bc/adt/security/` (lì sta il
-ticket SSO di `reentranceTicket`). Il confronto avviene sul percorso decodificato, senza distinguere
-le maiuscole e senza parametri `;`. Se la forma è ambigua (decodifica instabile, `..`, caratteri di
-controllo) la richiesta viene rifiutata. `getObjectSource` accetta solo URL con la forma di un
+che lo usa. In sola lettura il client ammette richieste solo sotto `/sap/bc/adt/`. L'unica eccezione
+è il logoff della libreria (`/sap/public/bc/icf/logoff`): WebGUI, WebRFC, OData ed echo vengono
+rifiutati prima della rete. Dentro ADT rifiuta anche `/sap/bc/adt/security/`, dove sta il ticket SSO
+di `reentranceTicket`. Un segmento con caratteri non ASCII, spazio, `;`, parentesi o un punto
+finale viene rifiutato. I tool con URL libero non accettano parametri `sap-*` né `~*` nella query.
+Gli id di `traces*` e `atcWorklists` devono essere un solo segmento. Il confronto avviene sul
+percorso decodificato, senza distinguere le maiuscole. Se la forma è ambigua (decodifica instabile,
+`..`, caratteri fuori dall'elenco) la richiesta viene rifiutata. `getObjectSource` accetta solo URL con la forma di un
 sorgente ADT: `.../source/main`, oppure `/sap/bc/adt/oo/classes/<classe>/includes/<include>`.
 
 Sono scritture: trasporti (`createTransport`, `transport*` che modificano, `setTransportsConfig`,
