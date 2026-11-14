@@ -37,11 +37,32 @@ salvo indicazione contraria.
 
 | `SAP_READ_ONLY` | effetto |
 |---|---|
-| non impostata, vuota, `1` o qualunque altro valore | **sola lettura**: 83 tool su 128 |
+| non impostata, vuota, `1` o qualunque altro valore | **sola lettura**: 66 tool su 128 |
 | `0` oppure `false` (senza distinzione di maiuscole) | catalogo completo: 128 tool |
 
-In sola lettura i 45 tool di scrittura **non vengono registrati** in `tools/list` e `Runtime.invoke` li
-rifiuta comunque, prima di qualunque richiesta a SAP, se un client con un catalogo vecchio li chiama.
+In sola lettura si registra in `tools/list` **solo l'elenco chiuso delle letture** (`READ_TOOLS` in
+`src/toolPolicy.ts`, uguale a [`tools-readonly.txt`](tools-readonly.txt)). `Runtime.invoke` rifiuta ogni
+altro nome prima di qualunque richiesta a SAP, anche se un client con un catalogo vecchio lo chiama. Un
+tool nuovo non classificato resta quindi fuori dalla sola lettura finché qualcuno non lo aggiunge
+all'elenco di proposito.
+
+Restano fuori, oltre alle 45 scritture, 17 tool che non sono scritture classificate ma non sono letture
+sicure (`READ_ONLY_EXCLUDED`, ciascuno con il motivo): `checkRepo` e `fixEdits` (POST verso un percorso
+scelto da chi chiama), `atcCheckVariant` (crea una worklist ATC), `reentranceTicket` (ticket SSO in
+chiaro), `gitExternalRepoInfo` e `remoteRepoInfo` (SAP contatta un URL esterno), le quattro letture del
+debugger, i refactoring `*Evaluate`/`*Preview`, `fixProposals`, `validateNewObject` e `atcContactUri`
+(servono solo a preparare una scrittura, su endpoint condivisi con le scritture).
+
+Seconda difesa, indipendente dall'elenco dei tool: in sola lettura `BoundedHttpClient`
+(`src/lib/http.ts`) rifiuta, prima della rete, ogni metodo diverso da GET, salvo le POST di
+`READ_ONLY_POSTS`. È un elenco chiuso di percorsi esatti, ciascuno con le sole chiavi di query che
+la libreria invia (e il valore obbligato quando distingue la voce), e con la riga di `abap-adt-api`
+che lo usa. In sola lettura il client rifiuta anche le GET sotto `/sap/bc/adt/security/` (lì sta il
+ticket SSO di `reentranceTicket`). Il confronto avviene sul percorso decodificato, senza distinguere
+le maiuscole e senza parametri `;`. Se la forma è ambigua (decodifica instabile, `..`, caratteri di
+controllo) la richiesta viene rifiutata. `getObjectSource` accetta solo URL con la forma di un
+sorgente ADT: `.../source/main`, oppure `/sap/bc/adt/oo/classes/<classe>/includes/<include>`.
+
 Sono scritture: trasporti (`createTransport`, `transport*` che modificano, `setTransportsConfig`,
 `createTransportsConfig`), `lock`/`unLock`, `setObjectSource`, `createObject`, `createTestInclude`,
 `deleteObject`, `activateObjects`/`activateByName`, `runClass`, `unitTestRun`/`unitTestEvaluation`,
@@ -55,11 +76,12 @@ dopo un timeout) e `healthcheck`, che riporta `readOnly` e il numero di tool esp
 `runQuery` e `tableContents` restano, ma la descrizione inizia con "ATTENZIONE: legge dati di
 produzione".
 
-La classificazione sta in un solo punto, `src/toolPolicy.ts` (`WRITE_TOOLS`, `DESTRUCTIVE_TOOLS`,
-`SESSION_TOOLS`, `DATA_READ_TOOLS`), che alimenta anche le annotazioni MCP standard `readOnlyHint`,
-`destructiveHint`, `idempotentHint` e `openWorldHint`. L'elenco dei tool esposti in sola lettura è in
-[`tools-readonly.txt`](tools-readonly.txt); `test/readOnly.test.ts` confronta il catalogo con quel file,
-quindi un tool nuovo non classificato fa fallire i test invece di comparire in silenzio in sola lettura.
+La classificazione sta in un solo punto, `src/toolPolicy.ts` (`READ_TOOLS`, `READ_ONLY_EXCLUDED`,
+`WRITE_TOOLS`, `DESTRUCTIVE_TOOLS`, `SESSION_TOOLS`, `DATA_READ_TOOLS`), che alimenta anche le
+annotazioni MCP standard `readOnlyHint`, `destructiveHint`, `idempotentHint` e `openWorldHint`.
+`test/readOnly.test.ts` esige che ogni tool del catalogo stia in esattamente uno fra `READ_TOOLS`,
+`WRITE_TOOLS` e `READ_ONLY_EXCLUDED`, che `READ_TOOLS` coincida con `tools-readonly.txt` e con
+`tools/list` in sola lettura, e che ogni voce di `READ_ONLY_POSTS` citi una riga reale della libreria.
 `npm run verify:stdio` gira con `SAP_READ_ONLY=0` perché il flusso verificato comprende una scrittura.
 
 ### Auto-relogin in sola lettura (`SAP_AUTO_RELOGIN`)
