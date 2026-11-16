@@ -9,11 +9,22 @@ import { Runtime } from "../src/server.js";
 import {
   DATA_READ_TOOLS,
   DESTRUCTIVE_TOOLS,
+  LOCAL_TOOLS,
+  READ_ONLY_EXCLUDED,
+  READ_TOOLS,
   SESSION_TOOLS,
   WRITE_TOOLS,
   readOnlyMode,
   toolAnnotations,
 } from "../src/toolPolicy.js";
+import { READ_ONLY_POSTS } from "../src/lib/http.js";
+import contracts from "../src/lib/input-contracts.json" with { type: "json" };
+
+const frozenList = () =>
+  readFileSync(new URL("../tools-readonly.txt", import.meta.url), "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .sort();
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const entry = fileURLToPath(new URL("../src/index.ts", import.meta.url));
@@ -92,6 +103,54 @@ test("classificazione coerente: distruttivi e dati sono sottoinsiemi noti", () =
   assert.equal(toolAnnotations("deleteObject").destructiveHint, true);
   assert.equal(toolAnnotations("createObject").readOnlyHint, false);
   assert.equal(toolAnnotations("getObjectSource").readOnlyHint, true);
+  assert.equal(toolAnnotations("checkRepo").readOnlyHint, false);
+});
+
+test("elenco chiuso: ogni tool del catalogo sta in esattamente uno fra letture, scritture ed esclusi", () => {
+  const catalog = [
+    ...new Runtime({ SAP_READ_ONLY: "0" }).tools.map((t) => t.definition.name),
+    "healthcheck",
+    "readResultPage",
+  ];
+  for (const n of catalog) {
+    const where = [READ_TOOLS.has(n), WRITE_TOOLS.has(n), n in READ_ONLY_EXCLUDED].filter(Boolean);
+    assert.equal(where.length, 1, `tool non classificato o classificato due volte: ${n}`);
+  }
+  for (const n of [...READ_TOOLS, ...Object.keys(READ_ONLY_EXCLUDED)])
+    assert.ok(catalog.includes(n), `nome inesistente nella classificazione: ${n}`);
+  for (const n of [...SESSION_TOOLS, ...LOCAL_TOOLS, ...DATA_READ_TOOLS]) assert.ok(READ_TOOLS.has(n), n);
+  // Esclusioni chieste dal red team (DIF-1, DIF-10): mai fra le letture.
+  for (const n of ["checkRepo", "fixEdits", "atcCheckVariant", "reentranceTicket", "gitExternalRepoInfo", "remoteRepoInfo"]) {
+    assert.ok(!READ_TOOLS.has(n), n);
+    assert.ok(READ_ONLY_EXCLUDED[n], `${n} senza motivo di esclusione`);
+  }
+  // Fra i git* resta solo gitRepos (elenco locale, nessun remoto).
+  assert.deepEqual([...READ_TOOLS].filter((n) => /^git|Repo(Info)?$/.test(n)), ["gitRepos"]);
+  // READ_TOOLS e tools-readonly.txt sono lo stesso elenco.
+  assert.deepEqual([...READ_TOOLS].sort(), frozenList());
+});
+
+test("elenco chiuso allineato a input-contracts.json e alle POST di lettura", () => {
+  const contractNames = new Set(Object.keys(contracts));
+  // I contratti coprono esattamente i tool dei handler (generati: scripts/generate-input-contracts.mjs).
+  const handlerTools = new Runtime({ SAP_READ_ONLY: "0" }).tools.map((t) => t.definition.name);
+  assert.deepEqual([...contractNames].sort(), [...handlerTools].sort());
+  for (const n of READ_TOOLS)
+    if (!["healthcheck", "readResultPage"].includes(n)) assert.ok(contractNames.has(n), `contratto mancante: ${n}`);
+  // Ogni POST di lettura serve a un tool dell'elenco, e ogni voce dichiara la riga di libreria.
+  for (const p of READ_ONLY_POSTS) {
+    assert.ok(p.tools.length > 0 && p.tools.every((t) => READ_TOOLS.has(t)), p.path);
+    assert.match(p.source, /^[a-zA-Z]+\.js:\d+ /, p.path);
+    assert.match(p.path, /^\/sap\/bc\/adt\/[a-z/A-Z]+$/, p.path);
+  }
+  // Ogni riga citata esiste davvero nella libreria e contiene il percorso.
+  for (const p of READ_ONLY_POSTS)
+    for (const ref of p.source.split("; ")) {
+      const [, file, line] = ref.match(/^([a-zA-Z]+\.js):(\d+)/)!;
+      const text = readFileSync(new URL(`../node_modules/abap-adt-api/build/api/${file}`, import.meta.url), "utf8")
+        .split(/\r?\n/)[Number(line) - 1];
+      assert.ok(text.includes(`h.request(`) && text.includes(p.path), `${ref}: ${text}`);
+    }
 });
 
 test("in sola lettura una scrittura e' rifiutata anche se chiamata direttamente", async () => {
@@ -102,6 +161,9 @@ test("in sola lettura una scrittura e' rifiutata anche se chiamata direttamente"
       /read-only mode/,
     );
     await assert.rejects(r.invoke("lock", { objectUrl: "/sap/x" }), /read-only mode/);
+    // Non scrittura classificata ma fuori elenco: rifiutata lo stesso, prima della validazione.
+    await assert.rejects(r.invoke("reentranceTicket", {}), /read-only allowlist/);
+    await assert.rejects(r.invoke("unknownFutureTool", {}), /read-only allowlist/);
   } finally {
     await r.close();
   }
@@ -123,13 +185,9 @@ test("stdio, default: tools/list senza scritture, uguale a tools-readonly.txt", 
     assert.ok(names.includes(n), `${n} deve restare`);
   for (const n of DATA_READ_TOOLS)
     assert.match(tools.find((t) => t.name === n).description, /dati di produzione/);
-  // Elenco congelato: un tool nuovo non classificato fa fallire il test invece di
-  // comparire in silenzio in sola lettura.
-  const frozen = readFileSync(new URL("../tools-readonly.txt", import.meta.url), "utf8")
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .sort();
-  assert.deepEqual(names, frozen);
+  // Elenco chiuso: in sola lettura tools/list e' esattamente READ_TOOLS (= tools-readonly.txt).
+  assert.deepEqual(names, frozenList());
+  assert.deepEqual(names, [...READ_TOOLS].sort());
 });
 
 test("stdio, SAP_READ_ONLY=0: catalogo completo con le scritture annotate", async () => {

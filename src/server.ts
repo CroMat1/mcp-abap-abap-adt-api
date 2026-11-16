@@ -9,11 +9,16 @@ import { BoundedHttpClient, requestContext } from "./lib/http.js";
 import { ErrorCode, McpError, safeError } from "./lib/errors.js";
 import { toolSchema } from "./schema.js";
 import {
+  FREE_URL_ARGS,
   LOCAL_TOOLS,
+  PATH_ID_ARGS,
+  READ_ONLY_URL_ARGS,
+  argStrings,
+  readOnlyQueryAllowed,
   SESSION_TOOLS,
   autoReloginMode,
   isMutation,
-  isWriteTool,
+  isReadOnlyAllowed,
   readOnlyMode,
   toolAnnotations,
   toolDescription,
@@ -118,7 +123,7 @@ export class Runtime {
         throw new Error("SAP_CLIENT must have three digits");
       const bearer = env.SAP_BEARER_TOKEN;
       this.client = new CompatibleAdtClient(
-        new BoundedHttpClient(base),
+        new BoundedHttpClient(base, { readOnly: this.readOnly }),
         env.SAP_USER,
         bearer ? async () => bearer : env.SAP_PASSWORD!,
         env.SAP_CLIENT ?? "",
@@ -143,10 +148,10 @@ export class Runtime {
     )
       throw new Error("Duplicate tool name");
   }
-  /** Tool handler pubblicati in tools/list (in sola lettura senza le scritture). */
+  /** Tool handler pubblicati in tools/list (in sola lettura solo l'elenco chiuso READ_TOOLS). */
   get exposedTools() {
     return this.readOnly
-      ? this.tools.filter((t) => !isWriteTool(t.definition.name))
+      ? this.tools.filter((t) => isReadOnlyAllowed(t.definition.name))
       : this.tools;
   }
   /**
@@ -177,7 +182,7 @@ export class Runtime {
       this.autoRelogin &&
       this.readOnly &&
       !!this.client &&
-      !isWriteTool(name) &&
+      isReadOnlyAllowed(name) &&
       !SESSION_TOOLS.has(name) &&
       !LOCAL_TOOLS.has(name)
     );
@@ -189,12 +194,12 @@ export class Runtime {
   ) {
     if (this.closing)
       throw new McpError(ErrorCode.InternalError, "Server is closing");
-    // Difesa in profondita': in sola lettura una scrittura non e' in tools/list, ma un
-    // client con un catalogo vecchio potrebbe chiamarla lo stesso.
-    if (this.readOnly && isWriteTool(name))
+    // Difesa in profondita': in sola lettura un tool fuori elenco non e' in tools/list, ma un
+    // client con un catalogo vecchio potrebbe chiamarlo lo stesso.
+    if (this.readOnly && !isReadOnlyAllowed(name))
       throw new McpError(
         ErrorCode.MethodNotFound,
-        `Tool '${name}' is a write tool and this server runs in read-only mode (SAP_READ_ONLY)`,
+        `Tool '${name}' is not in the read-only allowlist and this server runs in read-only mode (SAP_READ_ONLY)`,
       );
     if (name === "healthcheck")
       return textResult({
@@ -223,6 +228,28 @@ export class Runtime {
         "Arguments do not match the tool schema",
       );
     const prepared = entry.validation.prepare(parsed.data);
+    // Giro 2: in sola lettura alcuni URL scelti da chi chiama devono avere una forma precisa
+    // (getObjectSource: solo sorgenti ADT), prima di qualunque richiesta a SAP.
+    const urlRule = this.readOnly ? READ_ONLY_URL_ARGS[name] : undefined;
+    if (urlRule && !urlRule.allowed(String(prepared[urlRule.arg] ?? "")))
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `${urlRule.arg} must be an ADT source URL (.../source/main or /sap/bc/adt/oo/classes/<class>/includes/<include>) in read-only mode (SAP_READ_ONLY)`,
+      );
+    // N-ABAP-1: sugli URL liberi niente parametri sap-* (mandante, lingua, utente) ne' ~* (ITS).
+    const freeArg = this.readOnly ? FREE_URL_ARGS[name] : undefined;
+    if (freeArg && !argStrings(prepared[freeArg]).every(readOnlyQueryAllowed))
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `${freeArg} must not carry sap-* or ~* query parameters in read-only mode (SAP_READ_ONLY)`,
+      );
+    // N-ABAP-1: id messi nel percorso senza codifica; un solo segmento, sempre.
+    const idRule = PATH_ID_ARGS[name];
+    if (idRule && !idRule.allowed(String(prepared[idRule.arg] ?? "")))
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `${idRule.arg} must be a single path segment (no '/', '..', '?', even encoded)`,
+      );
     if (signal?.aborted)
       throw new McpError(
         ErrorCode.InternalError,
